@@ -96,6 +96,10 @@ android {
     }
     testOptions {
         unitTests.isIncludeAndroidResources = true
+        unitTests.all { test ->
+            // Optional JVM run of the real speech pipeline (SpeechPipelineJvmTest): sherpa-onnx Linux JNI directory.
+            System.getenv("LAZURE_SHERPA_JNI_DIR")?.let { test.systemProperty("java.library.path", it) }
+        }
     }
 }
 

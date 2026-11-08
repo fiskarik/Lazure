@@ -72,7 +72,7 @@ class SpeechPipelineDeviceTest {
         val files = (0..5).map { File(ctx.filesDir, "lines/line$it.wav") }
         assumeTrue(files.all { it.exists() })
         val dec = MediaCodecAudioDecoder()
-        SpeakerMatcher(ctx).use { m ->
+        SpeakerMatcher(SpeechModelSource.assets(ctx)).use { m ->
             val e = files.map { m.embed(DspChain.floats(dec.decode16kMono(it.absolutePath))) }
             for (i in 0..5) Log.i("SPEECH_EVAL", "sim row $i: " + (0..5).joinToString(" ") { j -> "%.2f".format(SpeakerMatcher.cosine(e[i]!!, e[j]!!)) })
         }

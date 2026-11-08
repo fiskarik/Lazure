@@ -40,6 +40,27 @@ object SpeechModelPaths {
         runCatching { context.assets.open(path).close(); true }.getOrDefault(false)
 }
 
+/**
+ * Where the speech models are read from: the APK assets on a device, or a directory with the same layout as
+ * assets/ (what tools/models/fetch_models.sh writes) so the real pipeline can run in a JVM test with the sherpa-onnx
+ * Linux JNI build. DTLN and MossFormer2 run on onnxruntime-android and are only used from assets.
+ */
+class SpeechModelSource private constructor(private val context: Context?, private val dir: java.io.File?) {
+    val fromAssets: Boolean get() = dir == null
+
+    /** AssetManager for sherpa-onnx, or null when the models are plain files. */
+    val assets: android.content.res.AssetManager? get() = if (dir == null) context!!.assets else null
+
+    fun path(asset: String): String = dir?.let { java.io.File(it, asset).absolutePath } ?: asset
+
+    fun exists(asset: String): Boolean = if (dir != null) java.io.File(dir, asset).isFile else SpeechModelPaths.assetExists(context!!, asset)
+
+    companion object {
+        fun assets(context: Context) = SpeechModelSource(context, null)
+        fun directory(dir: java.io.File) = SpeechModelSource(null, dir)
+    }
+}
+
 /** MediaCodec based AudioDecoder + AudioPreprocessor: any Android-decodable file → mono 16 kHz PCM16. */
 class MediaCodecAudioDecoder {
     suspend fun decode16kMono(path: String, onProgress: (Float) -> Unit = {}): ShortArray {
@@ -191,9 +212,9 @@ data class PipelineOptions(
 )
 
 /** Matches separated sources to diarization speakers with speaker embeddings (CAM++), falling back to energy. */
-internal class SpeakerMatcher(context: Context) : AutoCloseable {
-    private val extractor = com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor(context.assets,
-        SpeakerEmbeddingExtractorConfig(model = SpeechModelPaths.EMBEDDING, numThreads = 2))
+internal class SpeakerMatcher(models: SpeechModelSource) : AutoCloseable {
+    private val extractor = com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor(models.assets,
+        SpeakerEmbeddingExtractorConfig(model = models.path(SpeechModelPaths.EMBEDDING), numThreads = 2))
 
     fun embed(x: FloatArray): FloatArray? {
         if (x.size < SpeechModelPaths.SAMPLE_RATE) return null          // < 1 s is not reliable
@@ -227,25 +248,88 @@ internal class SpeakerMatcher(context: Context) : AutoCloseable {
 
 data class PipelineSegment(val startMs: Long, val endMs: Long, val speaker: Int, val text: String, val overlap: Boolean = false)
 
+/** What pyannote's turns say about who is who, independent of the speaker embeddings (unit-tested). */
+internal object DiarizationEvidence {
+    /** A stretch (seconds) where exactly one diarizer id is active. */
+    data class Piece(val start: Float, val end: Float, val speaker: Int)
+
+    /**
+     * Stretches where exactly one diarizer id talks. Who is who is decided on these only: during an interruption the
+     * interrupter's id lies over the other person's words, and counting that time made a diarizer id that only ever
+     * appears in interruptions look like the interrupted speaker.
+     */
+    fun exclusivePieces(turns: List<com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationSegment>): List<Piece> {
+        data class Ev(val t: Float, val spk: Int, val d: Int)
+        val ev = turns.flatMap { listOf(Ev(it.start, it.speaker, 1), Ev(it.end, it.speaker, -1)) }.sortedWith(compareBy({ it.t }, { it.d }))
+        val active = HashMap<Int, Int>()
+        val out = ArrayList<Piece>()
+        var last = 0f
+        for (e in ev) {
+            val on = active.filterValues { it > 0 }.keys
+            if (on.size == 1 && e.t > last) out += Piece(last, e.t, on.first())
+            active.merge(e.spk, e.d, Int::plus); last = e.t
+        }
+        return out
+    }
+
+    /**
+     * Pairs of diarizer ids (smaller id first) heard talking at the same time for at least [minMs] in total. pyannote's
+     * local segmentation is reliable about simultaneous speech (0.92-0.97 on real interruptions), so such ids are two
+     * people even when CAM++ finds their short sentences alike.
+     */
+    fun simultaneousPairs(turns: List<com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationSegment>, minMs: Long): Set<Pair<Int, Int>> {
+        data class Ev(val t: Float, val spk: Int, val d: Int)
+        val ev = turns.flatMap { listOf(Ev(it.start, it.speaker, 1), Ev(it.end, it.speaker, -1)) }.sortedWith(compareBy({ it.t }, { it.d }))
+        val active = HashMap<Int, Int>()
+        val total = HashMap<Pair<Int, Int>, Float>()
+        var last = 0f
+        for (e in ev) {
+            val on = active.filterValues { it > 0 }.keys.sorted()
+            if (on.size >= 2 && e.t > last) for (a in on.indices) for (b in a + 1 until on.size) total.merge(on[a] to on[b], e.t - last, Float::plus)
+            active.merge(e.spk, e.d, Int::plus); last = e.t
+        }
+        return total.filterValues { it * 1000 >= minMs }.keys
+    }
+}
+
 /** VAD → ASR → diarization → timestamp alignment. Everything runs on-device through sherpa-onnx. */
-class SpeechPipeline(private val context: Context) {
+class SpeechPipeline(
+    private val context: Context,
+    private val models: SpeechModelSource = SpeechModelSource.assets(context),
+) {
     private val decoder = MediaCodecAudioDecoder()
-    private companion object { const val MAX_SIMULTANEOUS = 4 }
+    private companion object {
+        const val MAX_SIMULTANEOUS = 4
+        /** Shortest simultaneous speech marked as an interruption. A real "Автобус не приехал?" over the other person was 0.54 s. */
+        const val MIN_OVERLAP_MS = 300L
+        /** Shortest overlap worth running the (slow) separator on; shorter ones are marked but stay on the mixed transcript. */
+        const val MIN_SEPARATION_MS = 600L
+        /** Diarizer ids heard at the same time for at least this long are two different people. */
+        const val CANNOT_LINK_MS = 300L
+    }
 
     fun modelsAvailable(): Boolean = listOf(
         SpeechModelPaths.ASR_MODEL, SpeechModelPaths.ASR_TOKENS, SpeechModelPaths.VAD,
         SpeechModelPaths.SEGMENTATION, SpeechModelPaths.EMBEDDING,
-    ).all { SpeechModelPaths.assetExists(context, it) }
+    ).all { models.exists(it) }
 
     suspend fun run(
         audioPath: String,
         onProgress: (stage: String, fraction: Float) -> Unit,
         isCancelled: () -> Boolean = { false },
         options: PipelineOptions = PipelineOptions(),
+    ): List<PipelineSegment> = process({ decoder.decode16kMono(audioPath) { f -> onProgress("decode", f) } }, onProgress, isCancelled, options)
+
+    /** Runs everything after decoding on mono 16 kHz PCM16; [decode] is called once, its result is released early. */
+    internal suspend fun process(
+        decode: suspend () -> ShortArray,
+        onProgress: (stage: String, fraction: Float) -> Unit,
+        isCancelled: () -> Boolean = { false },
+        options: PipelineOptions = PipelineOptions(),
     ): List<PipelineSegment> {
         check(modelsAvailable()) { "Speech models are missing from the APK" }
         onProgress("decode", 0f)
-        var pcm: ShortArray? = decoder.decode16kMono(audioPath) { onProgress("decode", it) }
+        var pcm: ShortArray? = decode()
         android.util.Log.i("SpeechPipeline", "decoded ${pcm!!.size} samples (${pcm!!.size * 2 / 1_000_000} MB PCM16)")
 
         onProgress("enhance", 0f)
@@ -282,6 +366,9 @@ class SpeechPipeline(private val context: Context) {
             val diarRegions = overlapRegions(turns)
             if (samples.size <= 120 * 16000) android.util.Log.i("SpeechPipeline", "turns: " + turns.sortedBy { it.start }.joinToString(" ") { "${it.speaker}:${"%.1f".format(it.start)}-${"%.1f".format(it.end)}" })
             val overlapS = overlapSeconds(turns)
+            val pieces = DiarizationEvidence.exclusivePieces(turns)
+            val cannotLink = DiarizationEvidence.simultaneousPairs(turns, CANNOT_LINK_MS)
+            if (cannotLink.isNotEmpty()) android.util.Log.i("SpeechPipeline", "heard at the same time (different people): " + cannotLink.joinToString { "${it.first}+${it.second}" })
             android.util.Log.i("SpeechPipeline", "speakers=${turns.map { it.speaker }.distinct().size} overlapped=${"%.1f".format(overlapS)}s regions=${diarRegions.size} of ${samples.size / 16000}s")
 
             // Speakers first. The diarizer tends to over-split (4 clusters for 2 people on the English test clip), so every
@@ -289,13 +376,13 @@ class SpeechPipeline(private val context: Context) {
             // Words inside overlap regions are blends of voices and are left out of the embeddings.
             onProgress("speakers", 0f)
             val refined = if (options.refineSpeakers) {
-                runCatching { refineSpeakers(samples, tokens.filter { t -> diarRegions.none { t.ms in it.startMs..it.endMs } }, options, turns.map { it.speaker }.distinct().size, turns, utterances.map { it.start * 1000 / SpeechModelPaths.SAMPLE_RATE }) }
+                runCatching { refineSpeakers(samples, tokens.filter { t -> diarRegions.none { t.ms in it.startMs..it.endMs } }, options, turns.map { it.speaker }.distinct().size, turns, utterances.map { it.start * 1000 / SpeechModelPaths.SAMPLE_RATE }, pieces, cannotLink) }
                     .onFailure { android.util.Log.e("SpeechPipeline", "speaker refinement failed", it) }.getOrNull()
             } else null
             val units = refined?.units
             // One id space from here on: diarizer ids are translated to final ids. An "overlap" whose speakers collapse into
             // one person is the diarizer's over-split, not simultaneous speech, so it is dropped.
-            val d2f: Map<Int, Int> = if (units != null) diarizerToFinal(turns, units) else turns.map { it.speaker }.distinct().associateWith { it }
+            val d2f: Map<Int, Int> = if (units != null) diarizerToFinal(turns, pieces, units) else turns.map { it.speaker }.distinct().associateWith { it }
             val regions = if (units == null) diarRegions else diarRegions.mapNotNull { r ->
                 val f = r.spk.mapNotNull { d2f[it] }.distinct()
                 if (f.size >= 2) r.copy(spk = f) else null
@@ -307,24 +394,25 @@ class SpeechPipeline(private val context: Context) {
             // Stage 10: separate overlapped regions and recognise each source separately.
             val replaced = ArrayList<LongRange>()
             val separated = ArrayList<Tok>()
-            if (options.separate && regions.isNotEmpty() && SpeechModelPaths.assetExists(context, SpeechModelPaths.SEPARATOR)) {
+            val sepRegions = regions.filter { it.endMs - it.startMs >= MIN_SEPARATION_MS }
+            if (options.separate && sepRegions.isNotEmpty() && models.fromAssets && models.exists(SpeechModelPaths.SEPARATOR)) {
                 // Peak-memory control: the ASR model is released while the (large) separator runs, then reloaded.
                 recognizer!!.release(); recognizer = null
                 val sources = ArrayList<SeparatedRegion>()
                 runCatching {
                     val t0 = android.os.SystemClock.elapsedRealtime()
                     val refs = refined?.centroids
-                        ?: runCatching { SpeakerMatcher(context) }.getOrNull()?.use { m -> referenceEmbeddings(m, samples, turns, regions) } ?: emptyMap()
-                    val matcher = runCatching { SpeakerMatcher(context) }.getOrNull()
+                        ?: runCatching { SpeakerMatcher(models) }.getOrNull()?.use { m -> referenceEmbeddings(m, samples, turns, regions) } ?: emptyMap()
+                    val matcher = runCatching { SpeakerMatcher(models) }.getOrNull()
                     try {
                         OverlapSeparator(context).use { sep ->
                             var skipped = 0
                             // Longest overlaps first: they hold the most lost words, and the wall-clock cap drops the rest.
-                            regions.sortedByDescending { it.endMs - it.startMs }.forEachIndexed { idx, r ->
+                            sepRegions.sortedByDescending { it.endMs - it.startMs }.forEachIndexed { idx, r ->
                                 if (isCancelled()) error("cancelled")
                                 if (android.os.SystemClock.elapsedRealtime() - t0 > options.maxSeparationWallMs) { skipped++; return@forEachIndexed }
                                 separateRegion(sep, samples, activeAt, r, matcher, refs)?.let { sources += it }
-                                onProgress("separation", (idx + 1f) / regions.size * 0.8f)
+                                onProgress("separation", (idx + 1f) / sepRegions.size * 0.8f)
                             }
                             if (skipped > 0) android.util.Log.w("SpeechPipeline", "separation time cap reached, $skipped region(s) left on the mixed transcript")
                         }
@@ -340,9 +428,17 @@ class SpeechPipeline(private val context: Context) {
 
             onProgress("align", 0f)
             val all = ArrayList<Tok>()
-            for (t in tokens) {
+            // Speakers are assigned per word, not per sub-word token: a unit boundary between two BPE pieces split "опять"
+            // into "опя" | "ть", and a trailing "?" went to the next speaker. A word is a token starting with '▁' plus the
+            // pieces and punctuation after it; it takes the speaker at its first token.
+            var wordSpeaker = -1
+            for (t in tokens.sortedBy { it.ms }) {
                 if (replaced.any { t.ms in it }) continue            // words inside a separated region come from the separated streams
-                all += t.copy(speaker = units?.let { u -> speakerFromUnits(u, t.ms) } ?: speakerAt(turns, t.ms))
+                val body = t.text.trim('▁', ' ')
+                // a dialogue dash opens the next reply, it does not end the previous one
+                if (wordSpeaker < 0 || t.text.startsWith("▁") || t.text.startsWith(" ") || body == "—" || body == "–" || body == "-")
+                    wordSpeaker = units?.let { u -> speakerFromUnits(u, t.ms) } ?: speakerAt(turns, t.ms)
+                all += t.copy(speaker = wordSpeaker)
             }
             all += separated
             val out = groupTokens(all)
@@ -352,10 +448,10 @@ class SpeechPipeline(private val context: Context) {
         } finally { recognizer?.release() }
     }
 
-    private fun newRecognizer() = OfflineRecognizer(context.assets, OfflineRecognizerConfig(
+    private fun newRecognizer() = OfflineRecognizer(models.assets, OfflineRecognizerConfig(
         modelConfig = OfflineModelConfig(
-            nemo = OfflineNemoEncDecCtcModelConfig(model = SpeechModelPaths.ASR_MODEL),
-            tokens = SpeechModelPaths.ASR_TOKENS, numThreads = threads(), modelType = "nemo_ctc",
+            nemo = OfflineNemoEncDecCtcModelConfig(model = models.path(SpeechModelPaths.ASR_MODEL)),
+            tokens = models.path(SpeechModelPaths.ASR_TOKENS), numThreads = threads(), modelType = "nemo_ctc",
         ),
     ))
 
@@ -365,7 +461,12 @@ class SpeechPipeline(private val context: Context) {
     private fun markOverlaps(segs: List<PipelineSegment>, regions: List<Region>): List<PipelineSegment> =
         segs.map { s ->
             val withOther = segs.any { o -> o !== s && o.speaker != s.speaker && minOf(o.endMs, s.endMs) - maxOf(o.startMs, s.startMs) > 250 }
-            val inRegion = regions.any { r -> minOf(r.endMs, s.endMs) - maxOf(r.startMs, s.startMs) > 250 }
+            // or the diarizer heard this speaker in an overlap the segment touches: on mixed audio GigaAM often starts the
+            // interrupter's words only after the overlap (a 0.54 s overlap met "Автобус не приехал?" for 0.17 s)
+            val inRegion = regions.any { r ->
+                val o = minOf(r.endMs, s.endMs) - maxOf(r.startMs, s.startMs)
+                o > 250 || (o > 100 && s.speaker in r.spk)
+            }
             if (withOther || inRegion) s.copy(overlap = true) else s
         }
 
@@ -398,6 +499,7 @@ class SpeechPipeline(private val context: Context) {
     private fun refineSpeakers(
         samples: ShortArray, tokens: List<Tok>, options: PipelineOptions, diarizerCount: Int,
         turns: List<com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationSegment>, segmentStartsMs: List<Long>,
+        pieces: List<DiarizationEvidence.Piece>, cannotLink: Set<Pair<Int, Int>>,
     ): Refined? {
         if (tokens.size < 2) return null
         val sorted = tokens.sortedBy { it.ms }
@@ -422,7 +524,7 @@ class SpeechPipeline(private val context: Context) {
             if (endsSentence || gap > 350) { raws += cur!!; cur = null }
         }
         cur?.let { raws += it }
-        val matcher = SpeakerMatcher(context)
+        val matcher = SpeakerMatcher(models)
         try {
             fun norm(v: FloatArray): FloatArray { val n = Math.sqrt(v.sumOf { (it * it).toDouble() }).toFloat() + 1e-9f; return FloatArray(v.size) { v[it] / n } }
             fun dot(a: FloatArray, b: FloatArray): Float { var d = 0f; for (i in a.indices) d += a[i] * b[i]; return d }
@@ -490,6 +592,56 @@ class SpeechPipeline(private val context: Context) {
                 for (k in cents.indices) if (n[k] > 0) cents[k] = norm(sums[k])
             }
             fun live() = cents.indices.filter { k -> confident.any { label[it] == k } }
+            // Diarizer evidence, counted on exclusive speech only (see exclusivePieces).
+            fun exclusiveVotes(a: Long, b: Long): Map<Int, Double> {
+                val v = HashMap<Int, Double>()
+                for (p in pieces) { val o = minOf(b / 1000f, p.end) - maxOf(a / 1000f, p.start); if (o > 0) v.merge(p.speaker, o.toDouble(), Double::plus) }
+                return v
+            }
+            val unitDiar: List<Int?> = units.map { u ->
+                exclusiveVotes(u.start, u.end).maxByOrNull { it.value }?.key
+                    ?: pieces.map { p -> p to maxOf(0f, maxOf(p.start * 1000 - u.end, u.start - p.end * 1000)) }
+                        .filter { it.second <= 300f }.minByOrNull { it.second }?.first?.speaker
+            }
+            fun linked(a: Int?, b: Int?) = a != null && b != null && a != b && (minOf(a, b) to maxOf(a, b)) in cannotLink
+            /** The diarizer id a cluster mostly is (>= 60 % of its exclusive time), or null when it is mixed or unknown. */
+            fun clusterDiar(k: Int): Int? {
+                val v = HashMap<Int, Double>()
+                for (i in confident) if (label[i] == k) for ((d, o) in exclusiveVotes(units[i].start, units[i].end)) v.merge(d, o, Double::plus)
+                val best = v.maxByOrNull { it.value } ?: return null
+                return if (best.value >= 0.6 * v.values.sum()) best.key else null
+            }
+            /**
+             * The cluster's diarizer id when it has enough speech (>= 3 s) for that id to mean something. A 1 s cluster can
+             * sit inside a turn the diarizer gave to the wrong person, and its id then forbids the right merge.
+             */
+            fun reliableDiar(k: Int): Int? =
+                if (confident.filter { label[it] == k }.sumOf { len[it] } >= 3000) clusterDiar(k) else null
+            fun compatible(x: Int, y: Int) = !linked(reliableDiar(x), reliableDiar(y))
+            fun recenter() {
+                for (k in cents.indices) {
+                    val m = confident.filter { label[it] == k }
+                    if (m.isEmpty()) continue
+                    val sum = FloatArray(cents[k].size)
+                    for (i in m) emb[i]?.let { e -> for (d in e.indices) sum[d] += e[d] }
+                    cents[k] = norm(sum)
+                }
+            }
+            // A confident sentence whose diarizer id was heard talking over its cluster's main id is in the wrong cluster.
+            run {
+                var moved = 0
+                for (i in confident) {
+                    val d = unitDiar[i] ?: continue
+                    if (!linked(d, reliableDiar(label[i]))) continue
+                    val alt = live().filter { k -> k != label[i] && !linked(d, reliableDiar(k)) }.maxByOrNull { dot(cents[it], emb[i]!!) }
+                    label[i] = alt ?: run { cents += emb[i]!!.copyOf(); counts += 1; cents.size - 1 }
+                    moved++
+                }
+                if (moved > 0) {
+                    recenter()
+                    android.util.Log.i("SpeechPipeline", "moved $moved sentence(s) away from a speaker they were heard talking over")
+                }
+            }
             run {
                 val l = live()
                 android.util.Log.i("SpeechPipeline", "clusters before merge: " + l.joinToString { k -> "$k(${confident.filter { label[it] == k }.sumOf { len[it] } / 1000}s)" } +
@@ -501,10 +653,11 @@ class SpeechPipeline(private val context: Context) {
                 for (i in confident) if (label[i] == from) label[i] = into
                 cents[into] = norm(sum)
             }
-            // 4) agglomerative merge of near-identical centroids (an online pass over-splits one voice that varies in tone)
+            // 4) agglomerative merge of near-identical centroids (an online pass over-splits one voice that varies in tone);
+            // never across ids the diarizer heard at the same time
             while (true) {
                 val l = live(); var bi = -1; var bj = -1; var bs = -2f
-                for (x in l) for (y in l) if (x < y) { val sc = dot(cents[x], cents[y]); if (sc > bs) { bs = sc; bi = x; bj = y } }
+                for (x in l) for (y in l) if (x < y && compatible(x, y)) { val sc = dot(cents[x], cents[y]); if (sc > bs) { bs = sc; bi = x; bj = y } }
                 if (bi < 0 || bs < options.mergeSimilarity) break
                 android.util.Log.i("SpeechPipeline", "merge speakers $bj -> $bi (similarity ${"%.2f".format(bs)})")
                 merge(bj, bi)
@@ -517,22 +670,45 @@ class SpeechPipeline(private val context: Context) {
                 val l = live(); if (l.size <= 1) break
                 val dur = l.associateWith { k -> confident.filter { label[it] == k }.sumOf { len[it] } }
                 val sentences = l.associateWith { k -> confident.count { label[it] == k } }
-                fun nearest(k: Int) = l.filter { it != k }.maxByOrNull { dot(cents[k], cents[it]) }!!
+                fun nearest(k: Int) = l.filter { it != k && compatible(k, it) }.maxByOrNull { dot(cents[k], cents[it]) }
                 val tiny = l.filter { k ->
+                    val n = nearest(k) ?: return@filter false
                     (dur[k]!! < 4000 || sentences[k]!! <= 1) &&
-                        (dur[k]!! < 0.08 * total || dot(cents[k], cents[nearest(k)]) >= options.weakClusterSimilarity)
+                        (dur[k]!! < 0.08 * total || dot(cents[k], cents[n]) >= options.weakClusterSimilarity)
                 }.minByOrNull { dur[it]!! } ?: break
-                val target = nearest(tiny)
+                val target = nearest(tiny)!!
                 val sc = dot(cents[tiny], cents[target])
                 if (sc < options.absorbSimilarity) break
                 android.util.Log.i("SpeechPipeline", "absorb weak speaker $tiny (${dur[tiny]} ms) -> $target (similarity ${"%.2f".format(sc)})")
                 merge(tiny, target)
             }
+            // 5b) short replies with one diarizer id are one person. CAM++ on 1-2 s replies is unreliable (two replies of one
+            // real speaker scored 0.23), the diarizer's id is better evidence there. The smaller cluster must be short
+            // (< 3 s) and the other one must be (nearly, within 0.1) its most similar compatible cluster: pyannote does put
+            // two similar voices under one id, and then CAM++ points the short cluster elsewhere (0.73 vs 0.37).
+            while (true) {
+                val l = live(); var bi = -1; var bj = -1; var bs = -2f
+                val dur = l.associateWith { k -> confident.filter { label[it] == k }.sumOf { len[it] } }
+                for (x in l) for (y in l) if (x < y) {
+                    val small = if (dur[x]!! <= dur[y]!!) x else y
+                    val other = if (small == x) y else x
+                    if (dur[small]!! >= 3000) continue
+                    val dx = clusterDiar(x) ?: continue
+                    if (dx != clusterDiar(y)) continue
+                    val sc = dot(cents[x], cents[y])
+                    val bestAlt = l.filter { it != small && it != other && compatible(small, it) }.maxOfOrNull { dot(cents[small], cents[it]) } ?: -2f
+                    if (sc < bestAlt - 0.1f) continue
+                    if (sc > bs) { bs = sc; bi = other; bj = small }
+                }
+                if (bi < 0) break
+                android.util.Log.i("SpeechPipeline", "same diarizer id ${clusterDiar(bi)}: merge speakers $bj -> $bi (similarity ${"%.2f".format(bs)})")
+                merge(bj, bi)
+            }
             // The diarizer is tuned to over-split (threshold 0.5), so finding MORE people than it did is a red flag:
             // fold the most similar pairs together until the counts agree, but never merge clearly different voices.
             if (options.numSpeakers <= 0 && diarizerCount >= 1) while (live().size > diarizerCount) {
                 val l = live(); var bi = -1; var bj = -1; var bs = -2f
-                for (x in l) for (y in l) if (x < y) { val sc = dot(cents[x], cents[y]); if (sc > bs) { bs = sc; bi = x; bj = y } }
+                for (x in l) for (y in l) if (x < y && compatible(x, y)) { val sc = dot(cents[x], cents[y]); if (sc > bs) { bs = sc; bi = x; bj = y } }
                 if (bi < 0 || bs < 0.5f) break
                 android.util.Log.i("SpeechPipeline", "more speakers than the diarizer found ($diarizerCount): merge $bj -> $bi (similarity ${"%.2f".format(bs)})")
                 merge(bj, bi)
@@ -540,7 +716,11 @@ class SpeechPipeline(private val context: Context) {
             // fixed speaker count: merge the closest pair until k remain
             if (options.numSpeakers > 0) while (live().size > options.numSpeakers) {
                 val l = live(); var bi = -1; var bj = -1; var bs = -2f
-                for (x in l) for (y in l) if (x < y) { val sc = dot(cents[x], cents[y]); if (sc > bs) { bs = sc; bi = x; bj = y } }
+                // the user's count wins, but compatible pairs go first
+                for (pass in 0..1) {
+                    for (x in l) for (y in l) if (x < y && (pass == 1 || compatible(x, y))) { val sc = dot(cents[x], cents[y]); if (sc > bs) { bs = sc; bi = x; bj = y } }
+                    if (bi >= 0) break
+                }
                 merge(bj, bi)
             }
             // 6) short units: closest centroid by embedding when there is a trustworthy match, otherwise the diarizer's
@@ -549,29 +729,26 @@ class SpeechPipeline(private val context: Context) {
             // always one person (pyannote often separates the lowest voice cleanly) is trusted; an id that mixes two people
             // says nothing and the embedding decides.
             val joint = HashMap<Int, HashMap<Int, Double>>()
-            for (i in confident) for (t in turns) {
-                val o = minOf(units[i].end / 1000f, t.end) - maxOf(units[i].start / 1000f, t.start)
-                if (o > 0) joint.getOrPut(t.speaker) { HashMap() }.merge(label[i], o.toDouble(), Double::plus)
-            }
+            for (i in confident) for ((d, o) in exclusiveVotes(units[i].start, units[i].end))
+                joint.getOrPut(d) { HashMap() }.merge(label[i], o, Double::plus)
             fun prior(d: Int?, k: Int): Double {
                 val m = joint[d ?: return 0.0] ?: return 0.0
                 val tot = m.values.sum(); return if (tot > 0) (m[k] ?: 0.0) / tot else 0.0
             }
-            fun diarizerIdAt(a: Long, b: Long): Int? {
-                val votes = HashMap<Int, Double>()
-                for (t in turns) { val o = minOf(b / 1000f, t.end) - maxOf(a / 1000f, t.start); if (o > 0) votes.merge(t.speaker, o.toDouble(), Double::plus) }
-                return votes.maxByOrNull { it.value }?.key
-            }
             for (i in units.indices) if (label[i] < 0) {
-                val e = emb[i]; val d = diarizerIdAt(units[i].start, units[i].end)
+                val e = emb[i]; val d = unitDiar[i]
+                // a speaker this reply's diarizer id was heard talking over cannot have said it. When that rules out everybody,
+                // the diarizer has two people under one id (similar voices) and the constraint says nothing.
+                val cands = live().filter { k -> !linked(d, reliableDiar(k)) }.ifEmpty { live() }
                 var pick = -1; var best = Double.NEGATIVE_INFINITY; var bestSim = -2f
-                for (k in live()) {
+                for (k in cands) {
                     val sim = if (e != null) dot(cents[k], e) else 0f
                     val sc = sim + options.diarizerPriorWeight * prior(d, k)
                     if (sc > best) { best = sc; pick = k; bestSim = sim }
                 }
                 val trusted = pick >= 0 && ((e != null && bestSim >= options.shortUnitSimilarity) || prior(d, pick) >= 0.7)
-                if (!trusted) pick = label.getOrNull(i - 1)?.takeIf { it >= 0 } ?: label.drop(i + 1).firstOrNull { it >= 0 } ?: pick.coerceAtLeast(0)
+                if (!trusted) pick = label.getOrNull(i - 1)?.takeIf { it >= 0 && it in cands }
+                    ?: label.drop(i + 1).firstOrNull { it >= 0 && it in cands } ?: pick
                 label[i] = pick
             }
             // 7) final ids in order of first appearance, so "Speaker 1" is whoever talks first
@@ -585,15 +762,23 @@ class SpeechPipeline(private val context: Context) {
         } finally { matcher.close() }
     }
 
-    /** Maps each diarizer speaker id to the final speaker that talks most while it is active (null if it never does). */
-    private fun diarizerToFinal(turns: List<com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationSegment>, units: List<SpeakerUnit>): Map<Int, Int> {
+    /**
+     * Maps each diarizer id to the final speaker that talks most while that id talks alone; an id that never talks alone
+     * next to a sentence unit falls back to all its time (null if it never meets a unit).
+     */
+    private fun diarizerToFinal(turns: List<com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationSegment>, pieces: List<DiarizationEvidence.Piece>, units: List<SpeakerUnit>): Map<Int, Int> {
         val out = HashMap<Int, Int>()
-        for (d in turns.map { it.speaker }.distinct()) {
+        fun vote(spans: List<Pair<Float, Float>>): Map<Int, Double> {
             val votes = HashMap<Int, Double>()
-            for (t in turns) if (t.speaker == d) for (u in units) {
-                val o = minOf(u.endMs / 1000f, t.end) - maxOf(u.startMs / 1000f, t.start)
+            for ((a, b) in spans) for (u in units) {
+                val o = minOf(u.endMs / 1000f, b) - maxOf(u.startMs / 1000f, a)
                 if (o > 0) votes.merge(u.speaker, o.toDouble(), Double::plus)
             }
+            return votes
+        }
+        for (d in turns.map { it.speaker }.distinct()) {
+            val votes = vote(pieces.filter { it.speaker == d }.map { it.start to it.end })
+                .ifEmpty { vote(turns.filter { it.speaker == d }.map { it.start to it.end }) }
             votes.maxByOrNull { it.value }?.let { out[d] = it.key }
         }
         return out
@@ -617,6 +802,19 @@ class SpeechPipeline(private val context: Context) {
     /** Groups tokens per speaker (so simultaneous speakers do not interleave): break on >1 s silence or 30 s length. */
     private fun groupTokens(all: List<Tok>): ArrayList<PipelineSegment> {
         val out = ArrayList<PipelineSegment>()
+        val byTime = all.sortedBy { it.ms }
+        val times = LongArray(byTime.size) { byTime[it].ms }
+        /** Someone else spoke between two tokens of [spk]: at least 3 of their tokens or 300 ms of them. */
+        fun interrupted(spk: Int, from: Long, to: Long): Boolean {
+            var i = java.util.Arrays.binarySearch(times, from + 1).let { if (it < 0) -it - 1 else it }
+            while (i > 0 && times[i - 1] > from) i--
+            var n = 0; var first = -1L; var last = -1L
+            while (i < byTime.size && times[i] < to) {
+                if (byTime[i].speaker != spk && byTime[i].text.isNotBlank()) { n++; if (first < 0) first = times[i]; last = times[i] }
+                i++
+            }
+            return n >= 3 || (n > 0 && last - first >= 300)
+        }
         for ((spk, toks) in all.groupBy { it.speaker }) {
             val sorted = toks.sortedBy { it.ms }
             var start = 0L; var end = 0L; val sb = StringBuilder()
@@ -627,7 +825,8 @@ class SpeechPipeline(private val context: Context) {
             }
             for (t in sorted) {
                 if (sb.isEmpty()) start = t.ms
-                else if (t.ms - end > 1000 || t.ms - start > 30_000) { flush(); start = t.ms }
+                // a reply also ends where somebody else's reply comes in between, so the replies keep their order
+                else if (t.ms - end > 1000 || t.ms - start > 30_000 || interrupted(spk, end - 80, t.ms)) { flush(); start = t.ms }
                 // GigaAM CTC emits a token close to where it ends, so "timestamp + 80 ms" is the reply end. Extending the end
                 // to the next token or to the VAD segment end was measured to be 0.3-0.7 s late (tools/bench/token_timing_check.py).
                 sb.append(t.text); end = t.ms + 80
@@ -658,7 +857,7 @@ class SpeechPipeline(private val context: Context) {
             if (p != null && r.startMs - p.endMs < 300) merged[merged.lastIndex] = p.copy(endMs = r.endMs, spk = (p.spk + r.spk).distinct().sorted().take(MAX_SIMULTANEOUS))
             else merged += r.copy(spk = r.spk.take(MAX_SIMULTANEOUS))
         }
-        return merged.filter { it.endMs - it.startMs >= 600 }
+        return merged.filter { it.endMs - it.startMs >= MIN_OVERLAP_MS }
     }
 
     private fun rms(x: FloatArray): Double { var e = 0.0; for (v in x) e += v.toDouble() * v; return Math.sqrt(e / x.size.coerceAtLeast(1)) }
@@ -822,7 +1021,7 @@ class SpeechPipeline(private val context: Context) {
     private fun enhance(pcm: ShortArray, o: PipelineOptions, onProgress: (Float) -> Unit): Triple<ShortArray, ShortArray, ShortArray> {
         val hp = DspChain.highPass(pcm)
         val asr = if (o.normalize) DspChain.normalizeCompress(hp) else hp
-        if (!o.denoise || !SpeechModelPaths.assetExists(context, SpeechModelPaths.DTLN_1)) return Triple(asr, asr, hp)
+        if (!o.denoise || !models.fromAssets || !models.exists(SpeechModelPaths.DTLN_1)) return Triple(asr, asr, hp)
         val den = runCatching { DtlnDenoiser(context).use { it.process(hp, onProgress) } }
             .onFailure { android.util.Log.e("SpeechPipeline", "DTLN failed, continuing without it", it) }
             .getOrNull() ?: return Triple(asr, asr, hp)
@@ -841,9 +1040,9 @@ class SpeechPipeline(private val context: Context) {
 
     /** VAD runs on [vadSignal]; returned segments carry audio cut from [asrSignal] at the same sample positions. */
     private fun detectSpeech(vadSignal: ShortArray, asrSignal: ShortArray, threshold: Float): List<com.k2fsa.sherpa.onnx.SpeechSegment> {
-        val vad = Vad(context.assets, VadModelConfig(
+        val vad = Vad(models.assets, VadModelConfig(
             sileroVadModelConfig = SileroVadModelConfig(
-                model = SpeechModelPaths.VAD, threshold = threshold, minSilenceDuration = 0.4f,
+                model = models.path(SpeechModelPaths.VAD), threshold = threshold, minSilenceDuration = 0.4f,
                 minSpeechDuration = 0.25f, windowSize = 512, maxSpeechDuration = 25f,
             ),
             sampleRate = SpeechModelPaths.SAMPLE_RATE, numThreads = 1,
@@ -883,12 +1082,12 @@ class SpeechPipeline(private val context: Context) {
     }
 
     private fun diarize(samples: FloatArray, threshold: Float, numSpeakers: Int, onProgress: (Float) -> Unit): List<com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationSegment> {
-        val diar = OfflineSpeakerDiarization(context.assets, OfflineSpeakerDiarizationConfig(
+        val diar = OfflineSpeakerDiarization(models.assets, OfflineSpeakerDiarizationConfig(
             segmentation = OfflineSpeakerSegmentationModelConfig(
-                pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(model = SpeechModelPaths.SEGMENTATION),
+                pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(model = models.path(SpeechModelPaths.SEGMENTATION)),
                 numThreads = threads(),
             ),
-            embedding = SpeakerEmbeddingExtractorConfig(model = SpeechModelPaths.EMBEDDING, numThreads = threads()),
+            embedding = SpeakerEmbeddingExtractorConfig(model = models.path(SpeechModelPaths.EMBEDDING), numThreads = threads()),
             clustering = FastClusteringConfig(numClusters = numSpeakers, threshold = threshold),
             minDurationOn = 0.15f, minDurationOff = 0.3f,
         ))
@@ -927,7 +1126,9 @@ class SpeechPipeline(private val context: Context) {
         for (s in list) {
             val pi = lastIdx[s.speaker]
             val prev = pi?.let { merged[it] }
-            if (prev != null && s.startMs - prev.endMs < 600 && s.endMs - prev.startMs < 30_000) {
+            // ...but not across a reply of somebody else that started in between ("Нет, машину угнали." / "Серьёзно?" / ...)
+            val someoneElseBetween = pi != null && (pi + 1 until merged.size).any { merged[it].speaker != s.speaker }
+            if (prev != null && !someoneElseBetween && s.startMs - prev.endMs < 600 && s.endMs - prev.startMs < 30_000) {
                 merged[pi] = prev.copy(endMs = maxOf(prev.endMs, s.endMs), text = prev.text + " " + s.text)
             } else { merged += s; lastIdx[s.speaker] = merged.lastIndex }
         }
