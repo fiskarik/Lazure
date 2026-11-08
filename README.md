@@ -17,7 +17,7 @@ Lazure локально, **без интернета**, превращает а�
 | Импортирует аудио из памяти устройства | Системный выбор файла (SAF), любой формат, который декодирует Android | `data/recording/RecordingRepository.kt` |
 | Записывает аудио из интерфейса | Foreground-сервис, WAV 16 кГц, системный AEC | `service/RecordingService.kt` |
 | Преобразует речь в текст | GigaAM v3 CTC с пунктуацией (sherpa-onnx) | `data/recording/SpeechPipeline.kt` |
-| Определяет и разделяет говорящих | pyannote 3.0 + CAM++ и уточнение по эмбеддингам предложений | `SpeechPipeline.refineSpeakers` |
+| Определяет и разделяет говорящих | pyannote 3.0 + CAM++, уточнение по эмбеддингам предложений с учётом подсказок диаризатора (кто говорил одновременно) | `SpeechPipeline.refineSpeakers`, `DiarizationEvidence` |
 | Временные метки реплик | Время токенов GigaAM CTC: начало первого и метка последнего токена + 80 мс (правило выбрано замером) | `SpeechPipeline.groupTokens`, `tools/bench/token_timing_check.py` |
 | Отображает расшифровку | Плеер с волной, подсветка текущей реплики, переход по клику | `ui/recording/` |
 | Экспортирует в файл | JSON `{"transcript":[{speaker_id,start_ms,end_ms,text}]}` | `data/recording/TranscriptExport.kt` |
@@ -95,6 +95,8 @@ python3 tools/eval/evaluate.py --ref refs/ --hyp exports/ --timing timing.csv --
 ```
 
 Скрипт оценки считает WER, cpWER, DER, ошибки границ реплик и RTF.
+
+`SpeechPipelineJvmTest` прогоняет настоящий пайплайн приложения на компьютере, на Linux-сборке sherpa-onnx, и пишет JSON для этого скрипта. Так изменения распознавания и диаризации проверяются на реальных записях без телефона.
 
 Методика и результаты: [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md).
 
